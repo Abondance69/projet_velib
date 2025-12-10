@@ -3,18 +3,11 @@ from pyspark.sql.functions import sum, col
 
 # =====================================================
 # ÉTAPE 2 – Spark Streaming SANS Mongo, SANS HDFS
-# Source : dossier local dans le conteneur (/spark-apps/stream-input)
+# Source : dossier local dans le conteneur (/app/data/stream-input)
+# (./app sur ta machine hôte est monté en /app dans le conteneur)
 # =====================================================
 
 # 1) Création de la SparkSession
-# Pour l'instant on reste en local dans le conteneur.
-# -----------------------------------------------------
-# TODO MONGO PLUS TARD :
-# Quand Mongo sera configuré, tu pourras rajouter ici :
-#   .config("spark.mongodb.write.connection.uri",
-#           "mongodb://user:pwd@mongo:27017/velib.velib_streaming_stats")
-# et éventuellement changer le master en "spark://spark-master:7077"
-# -----------------------------------------------------
 spark = SparkSession.builder \
     .appName("velib_streaming_etape2") \
     .master("local[*]") \
@@ -23,11 +16,11 @@ spark = SparkSession.builder \
 spark.sparkContext.setLogLevel("WARN")
 
 # 2) Lecture STATIQUE pour déduire le schéma à partir de velib.csv
-#    (une seule fois, pas du streaming ici)
+#    -> on lit un fichier exemple dans /app/data/stream-input
 static_df = spark.read \
     .option("header", "true") \
     .option("sep", ";") \
-    .csv("/spark-apps/stream-input/velib.csv")
+    .csv("/app/data/stream-input/velib.csv")
 
 # On caste numbikesavailable en entier pour pouvoir faire des sommes
 static_df = static_df.withColumn(
@@ -41,24 +34,40 @@ static_df.printSchema()
 schema = static_df.schema  # schéma qu'on va réutiliser pour le streaming
 
 # 3) Lecture EN STREAMING du dossier surveillé
-#    Ici Spark va surveiller /spark-apps/stream-input dans le conteneur.
+#    Ici Spark va surveiller /app/data/stream-input dans le conteneur.
 streamDf = spark.readStream \
     .schema(schema) \
     .option("header", "true") \
     .option("sep", ";") \
-    .csv("/spark-apps/stream-input/")
-    #quand abondance fait le HDFS je change cela #
-    #.csv("hdfs://namenode:9000/users/ipssi/input/velib2")#
+    .csv("/app/data/stream-input/")
+    # Quand Abondance aura fini le HDFS, tu pourras remplacer par :
+    # .csv("hdfs://namenode:9000/users/ipssi/input/velib2")
 
 print("Le DataFrame est-il en streaming ?", streamDf.isStreaming)
 
-# 4) TRAITEMENT STREAMING – Étape 2
-#    Exemple demandé : groupBy("name").agg(sum("numbikesavailable"))
+# =====================================================
+# 4a) SORTIE SIMPLE – comme dans la slide
+#     On affiche directement le DataFrame streaming SANS traitement
+# =====================================================
+simpleQuery = streamDf.writeStream \
+    .outputMode("append") \
+    .format("console") \
+    .option("truncate", "false") \
+    .start()
+
+# Si tu veux faire une capture comme la slide 7 :
+# -> commente TOUTE la partie aggDf / query_console plus bas
+# -> remplace query_console.awaitTermination() par :
+# simpleQuery.awaitTermination()
+
+# =====================================================
+# 4b) TRAITEMENT STREAMING – Étape 2
+#     Exemple demandé : groupBy("name").agg(sum("numbikesavailable"))
+# =====================================================
 aggDf = streamDf.groupBy("name") \
     .agg(sum("numbikesavailable").alias("total_bikes"))
 
-# 5) SORTIE – Affichage en console
-#    C'est ce qui valide ton Étape 2 : voir les résultats dans la console.
+# 5) SORTIE – Affichage en console de l'agrégat
 query_console = aggDf.writeStream \
     .outputMode("complete") \
     .format("console") \

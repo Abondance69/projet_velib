@@ -6,6 +6,10 @@ from pyspark.sql.functions import (
     max as spark_max,
     sum as spark_sum
 )
+# api call ttes les heures pour réccupérer le json
+# while True:
+#     try:
+
 
 # ============================================================
 #  ⚙️ Initialisation de la SparkSession + config MongoDB
@@ -71,6 +75,7 @@ capacity_by_station = (
     df_clean
     .groupBy("name")
     .agg(spark_sum("capacity").alias("total_capacity"))
+    .orderBy("total_capacity", ascending=False)
 )
 
 # 🔹 Statistiques globales sur la capacité

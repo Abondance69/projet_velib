@@ -1,1 +1,9 @@
 *.md
+mongodb/
+app/.cache
+app/.ivy2
+app/.jupyter
+app/.local
+app/.ipython
+app/.ipynb_checkpoints
+app/.bash_history

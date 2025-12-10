@@ -39,9 +39,7 @@ streamDf = spark.readStream \
     .schema(schema) \
     .option("header", "true") \
     .option("sep", ";") \
-    .csv("/app/data/stream-input/")
-    # Quand Abondance aura fini le HDFS, tu pourras remplacer par :
-    # .csv("hdfs://namenode:9000/users/ipssi/input/velib2")
+    .csv("hdfs://namenode:9000/users/ipssi/input/velib.csv")
 
 print("Le DataFrame est-il en streaming ?", streamDf.isStreaming)
 

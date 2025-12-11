@@ -77,9 +77,8 @@ def save_to_hdfs_with_spark(data):
 
 
 def main():
-    # Pour tester : toutes les 60s
-    interval_seconds = 60
-    # Pour la version finale : 15 * 60 = 900
+    # 15 minutes
+    interval_seconds = 900
 
     print("=" * 70)
     print("🚀 COLLECTEUR VÉLIB → HDFS (via Spark)")

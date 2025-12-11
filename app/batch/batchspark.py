@@ -1,121 +1,114 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col,
-    avg,
-    min as spark_min,
-    max as spark_max,
-    sum as spark_sum
+    col, avg, min as spark_min, max as spark_max
 )
-# api call ttes les heures pour réccupérer le json
-# while True:
-#     try:
-
 
 # ============================================================
-#  ⚙️ Initialisation de la SparkSession + config MongoDB
+# 🚀 1. SparkSession avec connecteur MongoDB
 # ============================================================
 spark = (
     SparkSession.builder
-    .appName("velib-batch")
-    .master("local[*]")  # OK dans ton contexte docker
-    .config(
-        "spark.jars.packages",
-        "org.mongodb.spark:mongo-spark-connector_2.12:10.3.0"
-    )
-    # URI par défaut (écriture)
-    .config(
-        "spark.mongodb.write.connection.uri",
-        "mongodb://admin:pwd@mongodb-ipssi:27017/"
-        "velib.velib_batch_capacity?authSource=admin"
-    )
-    # URI par défaut (lecture si besoin)
-    .config(
-        "spark.mongodb.read.connection.uri",
-        "mongodb://admin:pwd@mongodb-ipssi:27017/"
-        "velib.velib_batch_capacity?authSource=admin"
-    )
+    .appName("velib-batch-api")
+    .master("local[*]")
+    .config("spark.jars.packages",
+            "org.mongodb.spark:mongo-spark-connector_2.12:10.3.0")
+    .config("spark.mongodb.write.connection.uri",
+            "mongodb://admin:pwd@mongodb-ipssi:27017/?authSource=admin")
+    .config("spark.mongodb.read.connection.uri",
+            "mongodb://admin:pwd@mongodb-ipssi:27017/?authSource=admin")
     .getOrCreate()
 )
 
-print("🚀 Spark session started")
+spark.sparkContext.setLogLevel("WARN")
+print("🚀 Spark session started (batch API)")
+
 
 # ============================================================
-#  📥 Lecture du CSV Velib depuis HDFS
+# 📂 2. Lecture des données API stockées dans HDFS
 # ============================================================
-df = (
-    spark.read
-    .option("header", True)
-    .option("inferSchema", True)
-    .option("delimiter", ";")
-    .csv("hdfs://namenode:9000/users/ipssi/input/velib.csv")
-)
+HDFS_PATH = "hdfs://namenode:9000/users/ipssi/input/velib_api/contract=Lyon/*.json"
 
-print("📄 Données brutes :")
-df.show(5)
+df_raw = spark.read.json(HDFS_PATH)
+
+print("📄 Données brutes API :")
+df_raw.show(5, truncate=False)
+
 
 # ============================================================
-#  🧹 Nettoyage / typage des colonnes utiles
+# 🧼 3. Nettoyage / sélection
 # ============================================================
-df_clean = (
-    df
-    .withColumn("capacity", col("capacity").cast("int"))
-    .withColumn("stationcode", col("stationcode").cast("int"))
-    .withColumn("numdocksavailable", col("numdocksavailable").cast("int"))
-    .withColumn("numbikesavailable", col("numbikesavailable").cast("int"))
-    .withColumn("mechanical", col("mechanical").cast("int"))
-    .withColumn("ebike", col("ebike").cast("int"))
-)
+df_clean = df_raw.select(
+    col("number").alias("stationcode"),
+    col("name"),
+    col("contract_name"),
+    col("bike_stands").alias("capacity"),
+    col("available_bikes"),
+    col("available_bike_stands"),
+    col("status"),
+    col("position.lat").alias("lat"),
+    col("position.lng").alias("lon"),
+    col("last_update"),
+    col("collection_timestamp")
+).withColumn("capacity", col("capacity").cast("int"))
+
+print("🧹 Données nettoyées :")
+df_clean.show(5, truncate=False)
+
 
 # ============================================================
-#  🧮 Calculs batch
+# 📊 4. Calculs batch
 # ============================================================
 
-# 🔹 Capacité totale par station (par nom de station)
+# ---- Statistiques par station ----
 capacity_by_station = (
-    df_clean
-    .groupBy("name")
-    .agg(spark_sum("capacity").alias("total_capacity"))
-    .orderBy("total_capacity", ascending=False)
+    df_clean.groupBy("stationcode", "name")
+    .agg(
+        spark_max("capacity").alias("max_capacity"),
+        avg("available_bikes").alias("avg_available_bikes"),
+        avg("available_bike_stands").alias("avg_available_stands")
+    )
 )
 
-# 🔹 Statistiques globales sur la capacité
-stats = df_clean.select(
-    avg("capacity").alias("moyenne"),
-    spark_min("capacity").alias("min"),
-    spark_max("capacity").alias("max"),
-)
-
-print("🏁 Capacité totale par station :")
+print("🏁 Statistiques par station :")
 capacity_by_station.show(20, truncate=False)
 
+# ---- Statistiques globales ----
+stats_globales = df_clean.select(
+    avg("capacity").alias("moyenne_capacity"),
+    spark_min("capacity").alias("min_capacity"),
+    spark_max("capacity").alias("max_capacity")
+)
+
 print("📊 Statistiques globales :")
-stats.show()
+stats_globales.show()
+
 
 # ============================================================
-#  💾 Écriture dans MongoDB (ROLE 2)
+# 💾 5. Écriture dans MongoDB
 # ============================================================
-print("💾 Insertion dans MongoDB...")
+print("💾 Insertion des résultats batch dans Mongo...")
 
-# 1️⃣ Table agrégée par station
 capacity_by_station.write \
     .format("mongodb") \
-    .mode("append") \
-    .option("connection.uri", "mongodb://admin:pwd@mongodb-ipssi:27017") \
+    .mode("overwrite") \
     .option("database", "velib") \
-    .option("collection", "velib_batch_capacity") \
+    .option("collection", "velib_batch_api_by_station") \
     .option("authSource", "admin") \
     .save()
 
-# 2️⃣ Table des stats globales
-stats.write \
+stats_globales.write \
     .format("mongodb") \
-    .mode("append") \
-    .option("connection.uri", "mongodb://admin:pwd@mongodb-ipssi:27017") \
+    .mode("overwrite") \
     .option("database", "velib") \
-    .option("collection", "velib_batch_stats") \
+    .option("collection", "velib_batch_api_stats") \
     .option("authSource", "admin") \
     .save()
 
-print("✅ Données batch écrites dans Mongo !")
+print("✅ Données batch API écrites dans Mongo !")
 
+
+# ============================================================
+# 📴 6. Stop Spark
+# ============================================================
 spark.stop()
+print("👋 Spark session stopped")

@@ -1,98 +1,101 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import sum, col
-
-# =====================================================
-# ÉTAPE 2 – Spark Streaming SANS Mongo, SANS HDFS
-# Source : dossier local dans le conteneur (/app/data/stream-input)
-# (./app sur ta machine hôte est monté en /app dans le conteneur)
-# =====================================================
-
-# 1) Création de la SparkSession
-spark = SparkSession.builder \
-    .appName("velib_streaming_etape2") \
-    .master("local[*]") \
-    .getOrCreate()
-
-spark.sparkContext.setLogLevel("WARN")
-
-# 2) Lecture STATIQUE pour déduire le schéma à partir de velib.csv
-#    -> on lit un fichier exemple dans /app/data/stream-input
-static_df = spark.read \
-    .option("header", "true") \
-    .option("sep", ";") \
-    .csv("/app/data/stream-input/velib.csv")
-
-# On caste numbikesavailable en entier pour pouvoir faire des sommes
-static_df = static_df.withColumn(
-    "numbikesavailable",
-    col("numbikesavailable").cast("int")
+from pyspark.sql.types import *
+from pyspark.sql.functions import (
+    col, avg, window, to_timestamp
 )
 
-print("====== SCHÉMA DÉDUIT À PARTIR DE velib.csv ======")
-static_df.printSchema()
+# ============================================================
+# 🚀 1. SparkSession avec connecteur MongoDB
+# ============================================================
+spark = (
+    SparkSession.builder
+    .appName("velib-streaming-api")
+    .master("local[*]")
+    .config("spark.jars.packages",
+            "org.mongodb.spark:mongo-spark-connector_2.12:10.3.0")
+    .config("spark.mongodb.write.connection.uri",
+            "mongodb://admin:pwd@mongodb-ipssi:27017/?authSource=admin")
+    .getOrCreate()
+)
 
-schema = static_df.schema  # schéma qu'on va réutiliser pour le streaming
+spark.sparkContext.setLogLevel("WARN")
+print("🚀 Spark session started (Streaming API)")
 
-# 3) Lecture EN STREAMING du dossier surveillé
-#    Ici Spark va surveiller /app/data/stream-input dans le conteneur.
-streamDf = spark.readStream \
-    .schema(schema) \
-    .option("header", "true") \
-    .option("sep", ";") \
-    .csv("hdfs://namenode:9000/users/ipssi/input/velib.csv")
+# ============================================================
+# 📌 2. Schéma NDJSON généré par le collecteur
+# ============================================================
+schema = StructType([
+    StructField("number", IntegerType(), True),
+    StructField("contract_name", StringType(), True),
+    StructField("name", StringType(), True),
+    StructField("address", StringType(), True),
+    StructField("bike_stands", IntegerType(), True),
+    StructField("available_bike_stands", IntegerType(), True),
+    StructField("available_bikes", IntegerType(), True),
+    StructField("status", StringType(), True),
+    StructField("last_update", LongType(), True),
+    StructField("collection_timestamp", StringType(), True),
+    StructField("position", StructType([
+        StructField("lat", DoubleType(), True),
+        StructField("lng", DoubleType(), True),
+    ]), True)
+])
 
-print("Le DataFrame est-il en streaming ?", streamDf.isStreaming)
+# ============================================================
+# 📂 3. Streaming depuis HDFS
+# ============================================================
+HDFS_PATH = "hdfs://namenode:9000/users/ipssi/input/velib_api/contract=Lyon/"
 
-# =====================================================
-# 4a) SORTIE SIMPLE – comme dans la slide
-#     On affiche directement le DataFrame streaming SANS traitement
-# =====================================================
-simpleQuery = streamDf.writeStream \
-    .outputMode("append") \
-    .format("console") \
-    .option("truncate", "false") \
-    .start()
+df_stream = (
+    spark.readStream
+        .schema(schema)
+        .json(HDFS_PATH)
+)
 
-# Si tu veux faire une capture comme la slide 7 :
-# -> commente TOUTE la partie aggDf / query_console plus bas
-# -> remplace query_console.awaitTermination() par :
-# simpleQuery.awaitTermination()
+# ============================================================
+# 🧼 4. Nettoyage + horodatage exploitable
+# ============================================================
+df_clean = df_stream.select(
+    col("number").alias("stationcode"),
+    col("name"),
+    col("bike_stands").alias("capacity"),
+    col("available_bikes"),
+    col("available_bike_stands"),
+    col("position.lat").alias("lat"),
+    col("position.lng").alias("lon"),
+    to_timestamp(col("collection_timestamp"), "yyyyMMdd_HHmmss").alias("ts")
+)
 
-# =====================================================
-# 4b) TRAITEMENT STREAMING – Étape 2
-#     Exemple demandé : groupBy("name").agg(sum("numbikesavailable"))
-# =====================================================
-aggDf = streamDf.groupBy("name") \
-    .agg(sum("numbikesavailable").alias("total_bikes"))
+# ============================================================
+# 📊 5. Statistiques en streaming avec fenêtre glissante
+# ============================================================
+agg_stream = (
+    df_clean
+        .withWatermark("ts", "10 minutes")
+        .groupBy(
+            window(col("ts"), "10 minutes", "5 minutes"),
+            col("stationcode"),
+            col("name")
+        )
+        .agg(
+            avg("available_bikes").alias("avg_available_bikes"),
+            avg("available_bike_stands").alias("avg_available_stands")
+        )
+)
 
-# 5) SORTIE – Affichage en console de l'agrégat
-query_console = aggDf.writeStream \
-    .outputMode("complete") \
-    .format("console") \
-    .option("truncate", "false") \
-    .start()
+# ============================================================
+# 💾 6. Écriture vers MongoDB (append)
+# ============================================================
+query = (
+    agg_stream.writeStream
+        .format("mongodb")
+        .option("checkpointLocation", "/tmp/velib_stream_checkpoint")
+        .option("database", "velib")
+        .option("collection", "velib_stream_api")
+        .outputMode("append")          # ✔️ OBLIGATOIRE avec MongoDB
+        .start()
+)
 
-# -----------------------------------------------------
-# TODO MONGO PLUS TARD :
-# Quand Mongo sera prêt, tu pourras ajouter par exemple :
-#
-# from pyspark.sql.functions import current_timestamp
-#
-# def write_row(batch_df, batch_id):
-#     # (optionnel) ajouter un timestamp
-#     # batch_df = batch_df.withColumn("batch_time", current_timestamp())
-#     (batch_df.write
-#         .format("mongodb")
-#         .mode("append")
-#         .save())
-#
-# query_mongo = aggDf.writeStream \
-#     .outputMode("update") \
-#     .foreachBatch(write_row) \
-#     .start()
-#
-# et utiliser query_mongo.awaitTermination() à la place
-# -----------------------------------------------------
+print("🔥 Streaming en cours… Données envoyées en continu vers MongoDB !")
 
-# 6) On laisse tourner le streaming
-query_console.awaitTermination()
+query.awaitTermination()

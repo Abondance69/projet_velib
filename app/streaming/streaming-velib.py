@@ -1,57 +1,101 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import sum, col
+from pyspark.sql.types import *
+from pyspark.sql.functions import (
+    col, avg, window, to_timestamp
+)
 
-# 1) Création de la SparkSession
-spark = SparkSession.builder \
-    .appName("velib_streaming") \
-    .master("local[*]") \
+# ============================================================
+# 🚀 1. SparkSession avec connecteur MongoDB
+# ============================================================
+spark = (
+    SparkSession.builder
+    .appName("velib-streaming-api")
+    .master("local[*]")
+    .config("spark.jars.packages",
+            "org.mongodb.spark:mongo-spark-connector_2.12:10.3.0")
+    .config("spark.mongodb.write.connection.uri",
+            "mongodb://admin:pwd@mongodb-ipssi:27017/?authSource=admin")
     .getOrCreate()
+)
 
 spark.sparkContext.setLogLevel("WARN")
+print("🚀 Spark session started (Streaming API)")
 
-# 2) Lecture STATIQUE pour déduire le schéma à partir de velib.csv
-static_df = spark.read \
-    .option("header", "true") \
-    .option("sep", ";") \
-    .csv("/spark-apps/stream-input/velib.csv")
+# ============================================================
+# 📌 2. Schéma NDJSON généré par le collecteur
+# ============================================================
+schema = StructType([
+    StructField("number", IntegerType(), True),
+    StructField("contract_name", StringType(), True),
+    StructField("name", StringType(), True),
+    StructField("address", StringType(), True),
+    StructField("bike_stands", IntegerType(), True),
+    StructField("available_bike_stands", IntegerType(), True),
+    StructField("available_bikes", IntegerType(), True),
+    StructField("status", StringType(), True),
+    StructField("last_update", LongType(), True),
+    StructField("collection_timestamp", StringType(), True),
+    StructField("position", StructType([
+        StructField("lat", DoubleType(), True),
+        StructField("lng", DoubleType(), True),
+    ]), True)
+])
 
-print("====== SCHÉMA DÉDUIT À PARTIR DE velib.csv ======")
-static_df.printSchema()
+# ============================================================
+# 📂 3. Streaming depuis HDFS
+# ============================================================
+HDFS_PATH = "hdfs://namenode:9000/users/ipssi/input/velib_api/contract=Lyon/"
 
-# On caste numbikesavailable en entier (si besoin)
-static_df = static_df.withColumn("numbikesavailable", col("numbikesavailable").cast("int"))
+df_stream = (
+    spark.readStream
+        .schema(schema)
+        .json(HDFS_PATH)
+)
 
-schema = static_df.schema  # on récupère le schéma corrigé
+# ============================================================
+# 🧼 4. Nettoyage + horodatage exploitable
+# ============================================================
+df_clean = df_stream.select(
+    col("number").alias("stationcode"),
+    col("name"),
+    col("bike_stands").alias("capacity"),
+    col("available_bikes"),
+    col("available_bike_stands"),
+    col("position.lat").alias("lat"),
+    col("position.lng").alias("lon"),
+    to_timestamp(col("collection_timestamp"), "yyyyMMdd_HHmmss").alias("ts")
+)
 
-# 3) Lecture EN STREAMING du DOSSIER avec le schéma trouvé
-streamDf = spark.readStream \
-    .schema(schema) \
-    .option("header", "true") \
-    .option("sep", ";") \
-    .csv("/spark-apps/stream-input/")
-    #quand abondance fait le HDFS je change cela #
-    #.csv("hdfs://namenode:9000/users/ipssi/input/velib2")#
+# ============================================================
+# 📊 5. Statistiques en streaming avec fenêtre glissante
+# ============================================================
+agg_stream = (
+    df_clean
+        .withWatermark("ts", "10 minutes")
+        .groupBy(
+            window(col("ts"), "10 minutes", "5 minutes"),
+            col("stationcode"),
+            col("name")
+        )
+        .agg(
+            avg("available_bikes").alias("avg_available_bikes"),
+            avg("available_bike_stands").alias("avg_available_stands")
+        )
+)
 
+# ============================================================
+# 💾 6. Écriture vers MongoDB (append)
+# ============================================================
+query = (
+    agg_stream.writeStream
+        .format("mongodb")
+        .option("checkpointLocation", "/tmp/velib_stream_checkpoint")
+        .option("database", "velib")
+        .option("collection", "velib_stream_api")
+        .outputMode("append")          # ✔️ OBLIGATOIRE avec MongoDB
+        .start()
+)
 
-print("Le DataFrame est-il en streaming ?", streamDf.isStreaming)
+print("🔥 Streaming en cours… Données envoyées en continu vers MongoDB !")
 
-# 4) Exemple : stations où numbikesavailable == 0
-dfclean = streamDf.where(col("numbikesavailable") == 0)
-
-query_clean = dfclean.writeStream \
-    .outputMode("append") \
-    .format("console") \
-    .option("truncate", "false") \
-    .start()
-
-# 5) Exemple : somme des vélos disponibles par station
-aggDf = streamDf.groupBy("name").agg(sum("numbikesavailable").alias("total_bikes"))
-
-query_agg = aggDf.writeStream \
-    .outputMode("complete") \
-    .format("console") \
-    .option("truncate", "false") \
-    .start()
-
-# 6) On attend que le streaming tourne
-query_agg.awaitTermination()
+query.awaitTermination()
